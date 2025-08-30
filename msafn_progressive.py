@@ -1,540 +1,440 @@
 """
-Multi-Stream Attention-Based Fusion Network (MSAFN) - Progressive Training Approach
-Network Intrusion Detection System
-
-This implementation uses progressive training where the model is first trained
-on normal traffic, then progressively adds different attack types.
+MSAFN Model Training - Progressive Training Approach
+Multi-Stream Attention-Based Fusion Network for Network Intrusion Detection
+Progressive training: Start with normal traffic, then gradually add attack samples
 """
 
-import os
+import tensorflow as tf
 import numpy as np
 import pandas as pd
-import tensorflow as tf
-from sklearn.preprocessing import LabelEncoder
-import logging
-from datetime import datetime
+import matplotlib.pyplot as plt
+from sklearn.metrics import classification_report, confusion_matrix
+from sklearn.utils import shuffle
+import os
+import datetime
 
 # Import custom modules
-from data_preprocessing import NetworkDataPreprocessor
-from model_components import MSAFNModel, create_callbacks, create_custom_loss, create_metrics
-from attention_visualization import AttentionVisualizer
-from utils import (setup_logging, save_experiment_config, calculate_class_weights,
-                  evaluate_model, plot_training_history, create_experiment_summary, 
-                  ExperimentTracker, create_progressive_training_visualization)
+from config import Config
+from data_preprocessor import DataPreprocessor
+from msafn_components import build_msafn_model, AdversarialTraining
+from visualization import AttentionVisualizer, ModelEvaluator
 
-class MSAFNProgressiveTraining:
-    """
-    MSAFN implementation with progressive training approach
-    """
+# Set random seeds for reproducibility
+tf.random.set_seed(42)
+np.random.seed(42)
+
+class MSAFNProgressiveTrainer:
+    """Progressive MSAFN trainer - starts with normal traffic, then adds attacks"""
     
-    def __init__(self, config):
-        self.config = config
+    def __init__(self):
         self.model = None
-        self.preprocessor = None
-        self.attention_visualizer = None
-        self.logger = None
-        self.experiment_tracker = ExperimentTracker(config['experiment_dir'])
-        self.stage_results = []
-        self.attention_history = []
+        self.history_normal = None
+        self.history_progressive = None
+        self.preprocessor = DataPreprocessor()
+        self.evaluator = ModelEvaluator()
         
-        # Setup directories
-        os.makedirs(config['log_dir'], exist_ok=True)
-        os.makedirs(config['model_dir'], exist_ok=True)
-        os.makedirs(config['plots_dir'], exist_ok=True)
+    def prepare_progressive_data(self):
+        """Prepare data for progressive training"""
+        print("=" * 60)
+        print("PREPARING DATA FOR PROGRESSIVE TRAINING")
+        print("=" * 60)
         
-        # Setup logging
-        self.logger, _ = setup_logging(config['log_dir'], 'msafn_progressive')
+        # Get separated normal and attack data
+        (X_normal, y_normal), (X_attack, y_attack), (X_all, y_all) = self.preprocessor.prepare_progressive_data()
         
-        # Save configuration
-        config_path = os.path.join(config['log_dir'], 'config.json')
-        save_experiment_config(config, config_path)
+        # Split normal data for initial training
+        from sklearn.model_selection import train_test_split
         
-        self.logger.info("MSAFN Progressive Training initialized")
-        self.logger.info(f"Configuration: {config}")
-    
-    def load_and_preprocess_data(self):
-        """
-        Load and preprocess data for progressive training
-        """
-        self.logger.info("Starting data loading and preprocessing for progressive training...")
-        
-        # Initialize preprocessor
-        self.preprocessor = NetworkDataPreprocessor(log_dir=self.config['log_dir'])
-        
-        # Load data
-        file_paths = [
-            self.config['data_files']['infilteration'],
-            self.config['data_files']['webattacks']
-        ]
-        
-        combined_df = self.preprocessor.load_data(file_paths)
-        
-        # Clean data
-        combined_df = self.preprocessor.clean_data(combined_df)
-        
-        # Analyze labels
-        label_counts = self.preprocessor.analyze_labels(combined_df)
-        
-        # Separate features and labels
-        X, y = self.preprocessor.separate_features_labels(combined_df)
-        
-        # Encode labels
-        y_encoded = self.preprocessor.encode_labels(y)
-        
-        # Get feature groups for multi-stream architecture
-        self.feature_groups = self.preprocessor.get_feature_groups()
-        
-        # Create progressive datasets
-        self.progressive_data = self.preprocessor.create_progressive_datasets(
-            X.values, y_encoded,
-            test_size=self.config['test_size'],
-            val_size=self.config['val_size'],
-            random_state=self.config['random_state']
+        X_normal_train, X_normal_val, y_normal_train, y_normal_val = train_test_split(
+            X_normal, y_normal, test_size=0.3, random_state=42
         )
         
-        # Scale features for all datasets
-        # Scale normal data
-        X_normal_train, y_normal_train = self.progressive_data['normal_train']
-        X_normal_val, y_normal_val = self.progressive_data['normal_val']
-        X_test, y_test = self.progressive_data['test']
-        
-        X_normal_train_scaled, X_normal_val_scaled = self.preprocessor.scale_features(
-            X_normal_train, X_normal_val
-        )
-        X_test_scaled = self.preprocessor.scaler.transform(X_test)
-        
-        # Update progressive data with scaled features
-        self.progressive_data['normal_train'] = (X_normal_train_scaled, y_normal_train)
-        self.progressive_data['normal_val'] = (X_normal_val_scaled, y_normal_val)
-        self.progressive_data['test'] = (X_test_scaled, y_test)
-        
-        # Scale incremental datasets
-        for i, dataset in enumerate(self.progressive_data['incremental_datasets']):
-            X_inc_train_scaled = self.preprocessor.scaler.transform(dataset['X_train'])
-            X_inc_val_scaled = self.preprocessor.scaler.transform(dataset['X_val'])
-            
-            self.progressive_data['incremental_datasets'][i]['X_train'] = X_inc_train_scaled
-            self.progressive_data['incremental_datasets'][i]['X_val'] = X_inc_val_scaled
-        
-        # Initialize attention visualizer
-        self.attention_visualizer = AttentionVisualizer(
-            feature_names=self.preprocessor.feature_names,
-            feature_groups=self.feature_groups,
-            save_dir=self.config['plots_dir']
+        # Split attack data
+        X_attack_train, X_attack_val, y_attack_train, y_attack_val = train_test_split(
+            X_attack, y_attack, test_size=0.3, random_state=42, stratify=y_attack
         )
         
-        self.logger.info("Progressive data preprocessing completed")
-        self.logger.info(f"Normal training set: {X_normal_train_scaled.shape}")
-        self.logger.info(f"Normal validation set: {X_normal_val_scaled.shape}")
-        self.logger.info(f"Test set: {X_test_scaled.shape}")
-        self.logger.info(f"Number of incremental stages: {len(self.progressive_data['incremental_datasets'])}")
+        # Final test set (mixed normal + attack)
+        X_test_final, _, y_test_final, _ = train_test_split(
+            X_all, y_all, test_size=0.2, random_state=42, stratify=y_all
+        )
+        
+        print(f"Normal training samples: {len(X_normal_train)}")
+        print(f"Normal validation samples: {len(X_normal_val)}")
+        print(f"Attack training samples: {len(X_attack_train)}")
+        print(f"Attack validation samples: {len(X_attack_val)}")
+        print(f"Final test samples: {len(X_test_final)}")
+        
+        return {
+            'normal_train': (X_normal_train, y_normal_train),
+            'normal_val': (X_normal_val, y_normal_val),
+            'attack_train': (X_attack_train, y_attack_train),
+            'attack_val': (X_attack_val, y_attack_val),
+            'test_final': (X_test_final, y_test_final)
+        }
     
     def build_model(self):
-        """
-        Build the MSAFN model
-        """
-        self.logger.info("Building MSAFN model for progressive training...")
+        """Build and compile the MSAFN model for progressive training"""
+        print("\\nBuilding MSAFN Model for Progressive Training...")
         
-        # Get the number of classes from the final incremental dataset
-        final_dataset = self.progressive_data['incremental_datasets'][-1]
-        num_classes = len(np.unique(final_dataset['y_train']))
-        
-        # Create model
-        self.model = MSAFNModel(
-            feature_groups=self.feature_groups,
-            num_classes=num_classes
-        )
-        
-        # Build model by calling it with sample data
-        X_normal_train, _ = self.progressive_data['normal_train']
-        sample_input = tf.random.normal((1, X_normal_train.shape[1]))
-        _ = self.model(sample_input)
+        self.model = build_msafn_model()
         
         # Print model summary
         self.model.summary()
-        self.logger.info("Model built successfully")
         
-        # Log model architecture to file
-        with open(os.path.join(self.config['log_dir'], 'model_summary.txt'), 'w') as f:
-            self.model.summary(print_fn=lambda x: f.write(x + '\n'))
-    
-    def train_stage_1_normal_only(self):
-        """
-        Stage 1: Train on normal traffic only
-        """
-        self.logger.info("="*60)
-        self.logger.info("STAGE 1: Training on Normal Traffic Only")
-        self.logger.info("="*60)
-        
-        # Get normal data
-        X_train, y_train = self.progressive_data['normal_train']
-        X_val, y_val = self.progressive_data['normal_val']
-        
-        # For normal-only training, we use binary classification (normal=1, anomaly=0)
-        # But since we only have normal data, we'll use an autoencoder-like approach
-        # or modify to detect anomalies later
-        
-        # Create loss function and metrics for normal training
-        loss_fn = 'mse'  # Use MSE for reconstruction-like training
-        metrics = ['mae']
-        
-        # Compile model for normal training (reconstruction task)
+        # Initial compilation for normal traffic (binary classification: normal vs anomaly)
         self.model.compile(
-            optimizer=tf.keras.optimizers.Adam(learning_rate=self.config['learning_rate']),
-            loss=loss_fn,
-            metrics=metrics
+            optimizer=tf.keras.optimizers.Adam(learning_rate=Config.LEARNING_RATE),
+            loss='sparse_categorical_crossentropy',  # Will change to categorical later
+            metrics=[
+                'accuracy',
+                tf.keras.metrics.Precision(name='precision'),
+                tf.keras.metrics.Recall(name='recall'),
+                tf.keras.metrics.F1Score(name='f1_score')
+            ]
         )
         
-        # Create callbacks
-        model_save_path = os.path.join(self.config['model_dir'], 'msafn_progressive_stage1.h5')
-        tensorboard_dir = os.path.join(self.config['log_dir'], 'tensorboard_stage1')
+        return self.model
+    
+    def setup_callbacks(self, phase="normal"):
+        """Setup training callbacks for different phases"""
+        callbacks = []
         
-        callbacks = create_callbacks(
-            model_save_path=model_save_path,
-            log_dir=tensorboard_dir,
-            patience=self.config['patience']
+        # Early stopping
+        patience = Config.PATIENCE if phase == "progressive" else Config.PATIENCE // 2
+        early_stopping = tf.keras.callbacks.EarlyStopping(
+            monitor='val_loss',
+            patience=patience,
+            min_delta=Config.MIN_DELTA,
+            restore_best_weights=True,
+            verbose=1
         )
+        callbacks.append(early_stopping)
         
-        # For normal-only training, use the input as target (autoencoder approach)
-        history = self.model.fit(
-            X_train, X_train,  # Input as target for reconstruction
-            validation_data=(X_val, X_val),
-            epochs=self.config['normal_epochs'],
-            batch_size=self.config['batch_size'],
+        # Model checkpoint
+        checkpoint_name = f'msafn_progressive_{phase}_best.keras'
+        model_checkpoint = tf.keras.callbacks.ModelCheckpoint(
+            filepath=os.path.join(Config.MODEL_SAVE_PATH, checkpoint_name),
+            monitor='val_f1_score',
+            mode='max',
+            save_best_only=True,
+            verbose=1
+        )
+        callbacks.append(model_checkpoint)
+        
+        # Reduce learning rate on plateau
+        reduce_lr = tf.keras.callbacks.ReduceLROnPlateau(
+            monitor='val_loss',
+            factor=0.5,
+            patience=5,
+            min_lr=1e-7,
+            verbose=1
+        )
+        callbacks.append(reduce_lr)
+        
+        # TensorBoard logging
+        log_dir = os.path.join(Config.LOGS_PATH, f"msafn_progressive_{phase}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}")
+        tensorboard = tf.keras.callbacks.TensorBoard(
+            log_dir=log_dir,
+            histogram_freq=1,
+            write_graph=True,
+            write_images=True
+        )
+        callbacks.append(tensorboard)
+        
+        return callbacks
+    
+    def train_phase1_normal(self, data_dict):
+        """Phase 1: Train on normal traffic only"""
+        print("\\n" + "=" * 60)
+        print("PHASE 1: TRAINING ON NORMAL TRAFFIC ONLY")
+        print("=" * 60)
+        
+        X_normal_train, y_normal_train = data_dict['normal_train']
+        X_normal_val, y_normal_val = data_dict['normal_val']
+        
+        # For normal-only training, we create a simple binary task
+        # All samples are labeled as 0 (normal)
+        y_normal_train_binary = np.zeros_like(y_normal_train)
+        y_normal_val_binary = np.zeros_like(y_normal_val)
+        
+        # Setup callbacks
+        callbacks = self.setup_callbacks(phase="normal")
+        
+        # Train on normal data
+        self.history_normal = self.model.fit(
+            X_normal_train, y_normal_train_binary,
+            batch_size=Config.BATCH_SIZE,
+            epochs=Config.NORMAL_EPOCHS,
+            validation_data=(X_normal_val, y_normal_val_binary),
             callbacks=callbacks,
             verbose=1
         )
         
-        # Store attention weights
-        sample_batch = X_train[:32]
-        _ = self.model(sample_batch, training=False)
-        attention_weights = self.model.get_attention_weights()
-        if attention_weights is not None:
-            avg_attention = np.mean(attention_weights.numpy(), axis=0)
-            self.attention_history.append(avg_attention)
-        
-        self.logger.info("Stage 1 (Normal-only) training completed")
-        
-        # Visualize attention weights for this stage
-        self.attention_visualizer.plot_stream_attention_weights(
-            attention_weights, epoch=f"stage_1", save=True
-        )
-        
-        return history
+        print("Phase 1 (Normal Traffic) Training Completed!")
+        return self.history_normal
     
-    def train_incremental_stages(self):
-        """
-        Progressive training stages with incremental attack types
-        """
-        X_test, y_test = self.progressive_data['test']
+    def train_phase2_progressive(self, data_dict):
+        """Phase 2: Progressive training with normal + attack data"""
+        print("\\n" + "=" * 60)
+        print("PHASE 2: PROGRESSIVE TRAINING WITH ATTACKS")
+        print("=" * 60)
         
-        for stage_idx, dataset in enumerate(self.progressive_data['incremental_datasets']):
-            stage_num = stage_idx + 2  # Stage 2, 3, 4, etc.
+        X_normal_train, y_normal_train = data_dict['normal_train']
+        X_normal_val, y_normal_val = data_dict['normal_val']
+        X_attack_train, y_attack_train = data_dict['attack_train']
+        X_attack_val, y_attack_val = data_dict['attack_val']
+        
+        # Combine normal and attack data
+        X_combined_train = np.vstack([X_normal_train, X_attack_train])
+        y_combined_train = np.hstack([y_normal_train, y_attack_train])
+        
+        X_combined_val = np.vstack([X_normal_val, X_attack_val])
+        y_combined_val = np.hstack([y_normal_val, y_attack_val])
+        
+        # Shuffle combined data
+        X_combined_train, y_combined_train = shuffle(X_combined_train, y_combined_train, random_state=42)
+        X_combined_val, y_combined_val = shuffle(X_combined_val, y_combined_val, random_state=42)
+        
+        # Convert to categorical for multi-class classification
+        y_combined_train_cat = tf.keras.utils.to_categorical(y_combined_train, num_classes=Config.NUM_CLASSES)
+        y_combined_val_cat = tf.keras.utils.to_categorical(y_combined_val, num_classes=Config.NUM_CLASSES)
+        
+        # Recompile model for multi-class classification
+        self.model.compile(
+            optimizer=tf.keras.optimizers.Adam(learning_rate=Config.LEARNING_RATE * 0.1),  # Lower LR
+            loss='categorical_crossentropy',
+            metrics=[
+                'accuracy',
+                tf.keras.metrics.Precision(name='precision'),
+                tf.keras.metrics.Recall(name='recall'),
+                tf.keras.metrics.F1Score(name='f1_score')
+            ]
+        )
+        
+        # Gradual introduction of attack samples
+        attack_ratios = [0.2, 0.5, 0.8, 1.0]  # Gradually increase attack sample ratio
+        
+        for i, ratio in enumerate(attack_ratios):
+            print(f"\\n--- Sub-phase 2.{i+1}: Attack ratio = {ratio:.1f} ---")
             
-            self.logger.info("="*60)
-            self.logger.info(f"STAGE {stage_num}: Adding Attack Types {dataset['attack_types']}")
-            self.logger.info("="*60)
+            # Select subset of attack samples
+            n_attack_samples = int(len(X_attack_train) * ratio)
+            attack_indices = np.random.choice(len(X_attack_train), n_attack_samples, replace=False)
             
-            # Get data for this stage
-            X_train = dataset['X_train']
-            y_train = dataset['y_train']
-            X_val = dataset['X_val']
-            y_val = dataset['y_val']
+            X_attack_subset = X_attack_train[attack_indices]
+            y_attack_subset = y_attack_train[attack_indices]
             
-            # Calculate class weights for this stage
-            class_weights = calculate_class_weights(y_train)
+            # Combine with normal data
+            X_progressive = np.vstack([X_normal_train, X_attack_subset])
+            y_progressive = np.hstack([y_normal_train, y_attack_subset])
             
-            # Handle class imbalance if specified
-            if self.config['handle_imbalance'] and stage_num > 2:  # Skip for first attack stage if too few samples
-                try:
-                    X_train, y_train = self.preprocessor.handle_class_imbalance(
-                        X_train, y_train,
-                        method=self.config['imbalance_method'],
-                        random_state=self.config['random_state']
-                    )
-                    # Recalculate class weights after resampling
-                    class_weights = calculate_class_weights(y_train)
-                except Exception as e:
-                    self.logger.warning(f"Could not apply SMOTE in stage {stage_num}: {str(e)}")
+            # Shuffle
+            X_progressive, y_progressive = shuffle(X_progressive, y_progressive, random_state=42)
             
-            # Create loss function and metrics for classification
-            num_classes = len(np.unique(y_train))
-            loss_fn = create_custom_loss(class_weights=list(class_weights.values()))
-            metrics = create_metrics()
+            # Convert to categorical
+            y_progressive_cat = tf.keras.utils.to_categorical(y_progressive, num_classes=Config.NUM_CLASSES)
             
-            # Recompile model for classification
-            self.model.compile(
-                optimizer=tf.keras.optimizers.Adam(learning_rate=self.config['learning_rate']),
-                loss=loss_fn,
-                metrics=metrics
+            # Train for fewer epochs in each sub-phase
+            epochs_subphase = Config.PROGRESSIVE_EPOCHS // len(attack_ratios)
+            
+            history_subphase = self.model.fit(
+                X_progressive, y_progressive_cat,
+                batch_size=Config.BATCH_SIZE,
+                epochs=epochs_subphase,
+                validation_data=(X_combined_val, y_combined_val_cat),
+                verbose=1
             )
-            
-            # Create callbacks for this stage
-            model_save_path = os.path.join(self.config['model_dir'], f'msafn_progressive_stage{stage_num}.h5')
-            tensorboard_dir = os.path.join(self.config['log_dir'], f'tensorboard_stage{stage_num}')
-            
-            callbacks = create_callbacks(
-                model_save_path=model_save_path,
-                log_dir=tensorboard_dir,
-                patience=self.config['patience']
-            )
-            
-            # Convert labels to categorical
-            y_train_cat = tf.keras.utils.to_categorical(y_train, num_classes=num_classes)
-            y_val_cat = tf.keras.utils.to_categorical(y_val, num_classes=num_classes)
-            
-            # Train for this stage
-            history = self.model.fit(
-                X_train, y_train_cat,
-                validation_data=(X_val, y_val_cat),
-                epochs=self.config['epochs_per_stage'],
-                batch_size=self.config['batch_size'],
-                callbacks=callbacks,
-                verbose=1,
-                class_weight=class_weights
-            )
-            
-            # Load best model for this stage
-            self.model = tf.keras.models.load_model(model_save_path, compile=False)
-            
-            # Recompile for evaluation
-            self.model.compile(
-                optimizer=tf.keras.optimizers.Adam(learning_rate=self.config['learning_rate']),
-                loss=loss_fn,
-                metrics=metrics
-            )
-            
-            # Evaluate on test set
-            self.logger.info(f"Evaluating Stage {stage_num}...")
-            
-            # For evaluation, we need to ensure test labels match the current number of classes
-            # Map test labels to current stage classes
-            unique_train_classes = np.unique(y_train)
-            test_mask = np.isin(y_test, unique_train_classes)
-            
-            if np.sum(test_mask) > 0:
-                X_test_stage = X_test[test_mask]
-                y_test_stage = y_test[test_mask]
-                
-                # Get class names for this stage
-                label_encoder = self.preprocessor.label_encoder
-                class_names = [label_encoder.classes_[i] for i in unique_train_classes]
-                
-                # Evaluate
-                results = evaluate_model(
-                    model=self.model,
-                    X_test=X_test_stage,
-                    y_test=y_test_stage,
-                    class_names=class_names,
-                    save_dir=os.path.join(self.config['plots_dir'], f'stage_{stage_num}')
-                )
-                
-                self.stage_results.append(results)
-                
-                self.logger.info(f"Stage {stage_num} Results:")
-                self.logger.info(f"  Accuracy: {results['accuracy']:.4f}")
-                self.logger.info(f"  AUC Score: {results['auc_score']:.4f}")
-                self.logger.info(f"  Macro F1: {results['macro_f1']:.4f}")
-            
-            # Store attention weights for this stage
-            sample_batch = X_train[:32]
-            _ = self.model(sample_batch, training=False)
-            attention_weights = self.model.get_attention_weights()
-            if attention_weights is not None:
-                avg_attention = np.mean(attention_weights.numpy(), axis=0)
-                self.attention_history.append(avg_attention)
-            
-            # Visualize attention weights for this stage
-            self.attention_visualizer.plot_stream_attention_weights(
-                attention_weights, epoch=f"stage_{stage_num}", save=True
-            )
-            
-            self.logger.info(f"Stage {stage_num} completed")
+        
+        # Final training phase with all data
+        print("\\n--- Final Progressive Training Phase ---")
+        callbacks = self.setup_callbacks(phase="progressive")
+        
+        self.history_progressive = self.model.fit(
+            X_combined_train, y_combined_train_cat,
+            batch_size=Config.BATCH_SIZE,
+            epochs=Config.PROGRESSIVE_EPOCHS,
+            validation_data=(X_combined_val, y_combined_val_cat),
+            callbacks=callbacks,
+            verbose=1
+        )
+        
+        print("Phase 2 (Progressive Training) Completed!")
+        return self.history_progressive
     
-    def final_evaluation(self):
-        """
-        Final comprehensive evaluation on complete test set
-        """
-        self.logger.info("="*60)
-        self.logger.info("FINAL EVALUATION ON COMPLETE TEST SET")
-        self.logger.info("="*60)
+    def evaluate_model(self, data_dict):
+        """Comprehensive model evaluation"""
+        print("\\n" + "=" * 60)
+        print("MODEL EVALUATION")
+        print("=" * 60)
         
-        X_test, y_test = self.progressive_data['test']
+        X_test, y_test = data_dict['test_final']
         
-        # Get class names
-        label_encoder = self.preprocessor.label_encoder
-        class_names = label_encoder.classes_
+        # Convert to categorical for evaluation
+        y_test_cat = tf.keras.utils.to_categorical(y_test, num_classes=Config.NUM_CLASSES)
         
-        # Final evaluation
-        final_results = evaluate_model(
-            model=self.model,
-            X_test=X_test,
-            y_test=y_test,
-            class_names=class_names,
-            save_dir=self.config['plots_dir']
+        # Predictions
+        y_pred_proba = self.model.predict(X_test)
+        y_pred = np.argmax(y_pred_proba, axis=1)
+        
+        # Evaluation metrics
+        test_loss, test_accuracy, test_precision, test_recall, test_f1 = self.model.evaluate(
+            X_test, y_test_cat, verbose=0
         )
         
-        # Log final results
-        self.logger.info("Final Progressive Training Results:")
-        self.logger.info(f"Accuracy: {final_results['accuracy']:.4f}")
-        self.logger.info(f"AUC Score: {final_results['auc_score']:.4f}")
-        self.logger.info(f"Macro F1: {final_results['macro_f1']:.4f}")
-        self.logger.info(f"Weighted F1: {final_results['weighted_f1']:.4f}")
+        print(f"Test Loss: {test_loss:.4f}")
+        print(f"Test Accuracy: {test_accuracy:.4f}")
+        print(f"Test Precision: {test_precision:.4f}")
+        print(f"Test Recall: {test_recall:.4f}")
+        print(f"Test F1-Score: {test_f1:.4f}")
         
-        # Save detailed results
-        summary = create_experiment_summary(
-            results=final_results,
-            config=self.config,
-            save_path=os.path.join(self.config['log_dir'], 'final_experiment_summary.json')
+        # Classification report
+        report = self.evaluator.generate_classification_report(y_test, y_pred)
+        
+        # Confusion matrix
+        self.evaluator.plot_confusion_matrix(
+            y_test, y_pred,
+            save_path=os.path.join(Config.PLOTS_PATH, 'confusion_matrix_progressive.png')
         )
         
-        # Add to experiment tracker
-        self.experiment_tracker.add_experiment(
-            name='MSAFN_Progressive',
-            results=final_results,
-            config=self.config
-        )
+        # Training history plots
+        if self.history_normal:
+            plt.figure(figsize=(15, 10))
+            
+            # Normal training history
+            plt.subplot(2, 2, 1)
+            plt.plot(self.history_normal.history['loss'], label='Normal Training Loss')
+            plt.plot(self.history_normal.history['val_loss'], label='Normal Validation Loss')
+            plt.title('Phase 1: Normal Training Loss')
+            plt.xlabel('Epoch')
+            plt.ylabel('Loss')
+            plt.legend()
+            
+            plt.subplot(2, 2, 2)
+            plt.plot(self.history_normal.history['accuracy'], label='Normal Training Accuracy')
+            plt.plot(self.history_normal.history['val_accuracy'], label='Normal Validation Accuracy')
+            plt.title('Phase 1: Normal Training Accuracy')
+            plt.xlabel('Epoch')
+            plt.ylabel('Accuracy')
+            plt.legend()
+            
+            # Progressive training history
+            if self.history_progressive:
+                plt.subplot(2, 2, 3)
+                plt.plot(self.history_progressive.history['loss'], label='Progressive Training Loss')
+                plt.plot(self.history_progressive.history['val_loss'], label='Progressive Validation Loss')
+                plt.title('Phase 2: Progressive Training Loss')
+                plt.xlabel('Epoch')
+                plt.ylabel('Loss')
+                plt.legend()
+                
+                plt.subplot(2, 2, 4)
+                plt.plot(self.history_progressive.history['accuracy'], label='Progressive Training Accuracy')
+                plt.plot(self.history_progressive.history['val_accuracy'], label='Progressive Validation Accuracy')
+                plt.title('Phase 2: Progressive Training Accuracy')
+                plt.xlabel('Epoch')
+                plt.ylabel('Accuracy')
+                plt.legend()
+            
+            plt.tight_layout()
+            plt.savefig(os.path.join(Config.PLOTS_PATH, 'training_history_progressive.png'), dpi=300, bbox_inches='tight')
+            plt.show()
         
-        return final_results
+        return {
+            'accuracy': test_accuracy,
+            'precision': test_precision,
+            'recall': test_recall,
+            'f1_score': test_f1,
+            'predictions': y_pred,
+            'probabilities': y_pred_proba
+        }
     
-    def visualize_progressive_results(self):
-        """
-        Create visualizations for progressive training results
-        """
-        self.logger.info("Creating progressive training visualizations...")
+    def visualize_attention(self, data_dict):
+        """Visualize attention weights"""
+        print("\\nGenerating Attention Visualizations...")
         
-        # Plot progressive training results
-        if self.stage_results:
-            create_progressive_training_visualization(
-                self.stage_results, 
-                self.config['plots_dir']
-            )
+        X_test, y_test = data_dict['test_final']
         
-        # Plot attention evolution
-        if self.attention_history:
-            self.attention_visualizer.plot_attention_evolution(
-                self.attention_history, 
-                save=True
-            )
+        # Initialize visualizer
+        visualizer = AttentionVisualizer(self.model, self.preprocessor.feature_names)
         
-        # Create comprehensive attention dashboard
-        X_test, y_test = self.progressive_data['test']
-        self.attention_visualizer.create_attention_dashboard(
-            model=self.model,
-            X_test=X_test,
-            y_test=y_test,
-            attention_history=self.attention_history
-        )
-        
-        self.logger.info("Progressive training visualizations completed")
-    
-    def run_complete_experiment(self):
-        """
-        Run the complete MSAFN progressive training experiment
-        """
-        start_time = datetime.now()
-        self.logger.info(f"Starting complete MSAFN Progressive Training experiment at {start_time}")
-        
+        # Plot attention heatmap
         try:
-            # Step 1: Load and preprocess data
-            self.load_and_preprocess_data()
+            behavioral_attention, fusion_attention = visualizer.extract_attention_weights(X_test[:100])
             
-            # Step 2: Build model
-            self.build_model()
+            visualizer.plot_attention_heatmap(
+                fusion_attention,
+                save_path=os.path.join(Config.PLOTS_PATH, 'attention_heatmap_progressive.png')
+            )
             
-            # Step 3: Train Stage 1 (Normal only)
-            stage1_history = self.train_stage_1_normal_only()
+            visualizer.plot_feature_attention_distribution(
+                X_test[:100], y_test[:100],
+                save_path=os.path.join(Config.PLOTS_PATH, 'feature_attention_progressive.png')
+            )
             
-            # Step 4: Train incremental stages
-            self.train_incremental_stages()
-            
-            # Step 5: Final evaluation
-            final_results = self.final_evaluation()
-            
-            # Step 6: Create visualizations
-            self.visualize_progressive_results()
-            
-            end_time = datetime.now()
-            duration = end_time - start_time
-            
-            self.logger.info(f"Progressive training experiment completed successfully in {duration}")
-            self.logger.info(f"Final Results Summary:")
-            self.logger.info(f"  - Accuracy: {final_results['accuracy']:.4f}")
-            self.logger.info(f"  - AUC Score: {final_results['auc_score']:.4f}")
-            self.logger.info(f"  - Macro F1: {final_results['macro_f1']:.4f}")
-            
-            return {
-                'model': self.model,
-                'stage_results': self.stage_results,
-                'final_results': final_results,
-                'attention_history': self.attention_history,
-                'duration': duration
-            }
+            visualizer.plot_stream_contributions(
+                X_test[:50],
+                save_path=os.path.join(Config.PLOTS_PATH, 'stream_contributions_progressive.png')
+            )
             
         except Exception as e:
-            self.logger.error(f"Progressive training experiment failed with error: {str(e)}")
-            raise
+            print(f"Warning: Could not generate attention visualizations: {e}")
+    
+    def save_model(self):
+        """Save the trained model"""
+        model_path = os.path.join(Config.MODEL_SAVE_PATH, 'msafn_progressive_final.keras')
+        self.model.save(model_path)
+        print(f"\\nModel saved to: {model_path}")
+        
+        # Save model architecture as JSON
+        model_json = self.model.to_json()
+        with open(os.path.join(Config.MODEL_SAVE_PATH, 'msafn_progressive_architecture.json'), 'w') as json_file:
+            json_file.write(model_json)
+        
+        return model_path
 
 def main():
-    """
-    Main function to run MSAFN progressive training
-    """
-    # Set console encoding to UTF-8 for Windows
-    import sys
-    if sys.platform == "win32":
-        import codecs
-        sys.stdout = codecs.getwriter("utf-8")(sys.stdout.detach())
-        sys.stderr = codecs.getwriter("utf-8")(sys.stderr.detach())
+    """Main progressive training pipeline"""
+    print("MSAFN Network Intrusion Detection - Progressive Training")
+    print("=" * 60)
     
-    # Configuration
-    config = {
-        # Data configuration
-        'data_files': {
-            'infilteration': 'Thursday-WorkingHours-Afternoon-Infilteration.pcap_ISCX.csv',
-            'webattacks': 'Thursday-WorkingHours-Morning-WebAttacks.pcap_ISCX.csv'
-        },
-        
-        # Training configuration
-        'normal_epochs': 50,  # Epochs for normal-only training
-        'epochs_per_stage': 30,  # Epochs per incremental stage
-        'batch_size': 256,
-        'learning_rate': 0.001,
-        'patience': 15,
-        
-        # Data split configuration
-        'test_size': 0.2,
-        'val_size': 0.1,
-        'random_state': 42,
-        
-        # Class imbalance handling
-        'handle_imbalance': True,
-        'imbalance_method': 'smote_tomek',
-        
-        # Directory configuration
-        'log_dir': 'logs/msafn_progressive',
-        'model_dir': 'models/msafn_progressive',
-        'plots_dir': 'plots/msafn_progressive',
-        'experiment_dir': 'experiments'
-    }
+    # Initialize trainer
+    trainer = MSAFNProgressiveTrainer()
     
-    # Create and run experiment
-    experiment = MSAFNProgressiveTraining(config)
-    results = experiment.run_complete_experiment()
-    
-    print("\\n" + "="*60)
-    print("MSAFN PROGRESSIVE TRAINING COMPLETED SUCCESSFULLY!")
-    print("="*60)
-    print(f"Final Accuracy: {results['final_results']['accuracy']:.4f}")
-    print(f"Final AUC Score: {results['final_results']['auc_score']:.4f}")
-    print(f"Final Macro F1: {results['final_results']['macro_f1']:.4f}")
-    print(f"Number of Progressive Stages: {len(results['stage_results']) + 1}")
-    print(f"Training Duration: {results['duration']}")
-    print("="*60)
+    try:
+        # Prepare data
+        data_dict = trainer.prepare_progressive_data()
+        
+        # Build model
+        model = trainer.build_model()
+        
+        # Phase 1: Train on normal traffic
+        history_normal = trainer.train_phase1_normal(data_dict)
+        
+        # Phase 2: Progressive training with attacks
+        history_progressive = trainer.train_phase2_progressive(data_dict)
+        
+        # Evaluate model
+        results = trainer.evaluate_model(data_dict)
+        
+        # Visualize attention
+        trainer.visualize_attention(data_dict)
+        
+        # Save model
+        model_path = trainer.save_model()
+        
+        print("\\n" + "=" * 60)
+        print("PROGRESSIVE TRAINING COMPLETED SUCCESSFULLY!")
+        print("=" * 60)
+        print(f"Final Results:")
+        print(f"- Test Accuracy: {results['accuracy']:.4f}")
+        print(f"- Test F1-Score: {results['f1_score']:.4f}")
+        print(f"- Model saved to: {model_path}")
+        print("- Visualizations saved to plots/ directory")
+        
+    except Exception as e:
+        print(f"\\nError during progressive training: {e}")
+        raise e
 
 if __name__ == "__main__":
-    # Set random seeds for reproducibility
-    np.random.seed(42)
-    tf.random.set_seed(42)
-    
-    # Run main function
     main()

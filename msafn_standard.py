@@ -1,377 +1,274 @@
 """
-Multi-Stream Attention-Based Fusion Network (MSAFN) - Standard Training Approach
-Network Intrusion Detection System
-
-This implementation uses standard training where the model is trained on
-mixed normal and attack data from the beginning.
+MSAFN Model Training - Standard Approach
+Multi-Stream Attention-Based Fusion Network for Network Intrusion Detection
 """
 
-import os
+import tensorflow as tf
 import numpy as np
 import pandas as pd
-import tensorflow as tf
-from sklearn.preprocessing import LabelEncoder
-import logging
-from datetime import datetime
+import matplotlib.pyplot as plt
+from sklearn.metrics import classification_report, confusion_matrix
+import os
+import datetime
 
 # Import custom modules
-from data_preprocessing import NetworkDataPreprocessor
-from model_components import MSAFNModel, create_callbacks, create_custom_loss, create_metrics
-from attention_visualization import AttentionVisualizer
-from utils import (setup_logging, save_experiment_config, calculate_class_weights,
-                  evaluate_model, plot_training_history, create_experiment_summary, ExperimentTracker)
+from config import Config
+from data_preprocessor import DataPreprocessor
+from msafn_components import build_msafn_model, AdversarialTraining
+from visualization import AttentionVisualizer, ModelEvaluator
 
-class MSAFNStandardTraining:
-    """
-    MSAFN implementation with standard training approach
-    """
+# Set random seeds for reproducibility
+tf.random.set_seed(42)
+np.random.seed(42)
+
+class MSAFNTrainer:
+    """Standard MSAFN trainer without progressive training"""
     
-    def __init__(self, config):
-        self.config = config
+    def __init__(self):
         self.model = None
-        self.preprocessor = None
-        self.attention_visualizer = None
-        self.logger = None
-        self.experiment_tracker = ExperimentTracker(config['experiment_dir'])
+        self.history = None
+        self.preprocessor = DataPreprocessor()
+        self.evaluator = ModelEvaluator()
         
-        # Setup directories
-        os.makedirs(config['log_dir'], exist_ok=True)
-        os.makedirs(config['model_dir'], exist_ok=True)
-        os.makedirs(config['plots_dir'], exist_ok=True)
+    def prepare_data(self):
+        """Prepare and split data for training"""
+        print("=" * 60)
+        print("PREPARING DATA FOR STANDARD TRAINING")
+        print("=" * 60)
         
-        # Setup logging
-        self.logger, _ = setup_logging(config['log_dir'], 'msafn_standard')
+        # Load and preprocess data
+        X, y = self.preprocessor.prepare_data(apply_balancing=True)
         
-        # Save configuration
-        config_path = os.path.join(config['log_dir'], 'config.json')
-        save_experiment_config(config, config_path)
+        # Split data
+        X_train, X_val, X_test, y_train, y_val, y_test = self.preprocessor.split_data(X, y)
         
-        self.logger.info("MSAFN Standard Training initialized")
-        self.logger.info(f"Configuration: {config}")
-    
-    def load_and_preprocess_data(self):
-        """
-        Load and preprocess the network intrusion detection datasets
-        """
-        self.logger.info("Starting data loading and preprocessing...")
+        # Convert to categorical
+        y_train_cat = tf.keras.utils.to_categorical(y_train, num_classes=Config.NUM_CLASSES)
+        y_val_cat = tf.keras.utils.to_categorical(y_val, num_classes=Config.NUM_CLASSES)
+        y_test_cat = tf.keras.utils.to_categorical(y_test, num_classes=Config.NUM_CLASSES)
         
-        # Initialize preprocessor
-        self.preprocessor = NetworkDataPreprocessor(log_dir=self.config['log_dir'])
-        
-        # Load data
-        file_paths = [
-            self.config['data_files']['infilteration'],
-            self.config['data_files']['webattacks']
-        ]
-        
-        combined_df = self.preprocessor.load_data(file_paths)
-        
-        # Clean data
-        combined_df = self.preprocessor.clean_data(combined_df)
-        
-        # Analyze labels
-        label_counts = self.preprocessor.analyze_labels(combined_df)
-        
-        # Separate features and labels
-        X, y = self.preprocessor.separate_features_labels(combined_df)
-        
-        # Encode labels
-        y_encoded = self.preprocessor.encode_labels(y)
-        
-        # Get feature groups for multi-stream architecture
-        self.feature_groups = self.preprocessor.get_feature_groups()
-        
-        # Prepare datasets for standard training
-        datasets = self.preprocessor.prepare_standard_datasets(
-            X.values, y_encoded,
-            test_size=self.config['test_size'],
-            val_size=self.config['val_size'],
-            random_state=self.config['random_state']
-        )
-        
-        self.X_train, self.y_train = datasets['train']
-        self.X_val, self.y_val = datasets['val']
-        self.X_test, self.y_test = datasets['test']
-        
-        # Handle class imbalance if specified
-        if self.config['handle_imbalance']:
-            self.logger.info("Handling class imbalance...")
-            self.X_train, self.y_train = self.preprocessor.handle_class_imbalance(
-                self.X_train, self.y_train,
-                method=self.config['imbalance_method'],
-                random_state=self.config['random_state']
-            )
-        
-        # Scale features
-        self.X_train, self.X_val = self.preprocessor.scale_features(self.X_train, self.X_val)
-        self.X_test = self.preprocessor.scaler.transform(self.X_test)
-        
-        # Calculate class weights
-        self.class_weights = calculate_class_weights(self.y_train)
-        
-        # Initialize attention visualizer
-        self.attention_visualizer = AttentionVisualizer(
-            feature_names=self.preprocessor.feature_names,
-            feature_groups=self.feature_groups,
-            save_dir=self.config['plots_dir']
-        )
-        
-        self.logger.info("Data preprocessing completed")
-        self.logger.info(f"Training set: {self.X_train.shape}")
-        self.logger.info(f"Validation set: {self.X_val.shape}")
-        self.logger.info(f"Test set: {self.X_test.shape}")
-        self.logger.info(f"Number of classes: {len(np.unique(self.y_train))}")
-        self.logger.info(f"Class weights: {self.class_weights}")
+        return (X_train, X_val, X_test), (y_train_cat, y_val_cat, y_test_cat), (y_train, y_val, y_test)
     
     def build_model(self):
-        """
-        Build the MSAFN model
-        """
-        self.logger.info("Building MSAFN model...")
+        """Build and compile the MSAFN model"""
+        print("\\nBuilding MSAFN Model...")
         
-        # Create model
-        self.model = MSAFNModel(
-            feature_groups=self.feature_groups,
-            num_classes=len(np.unique(self.y_train))
-        )
-        
-        # Build model by calling it with sample data
-        sample_input = tf.random.normal((1, self.X_train.shape[1]))
-        _ = self.model(sample_input)
-        
-        # Create loss function
-        loss_fn = create_custom_loss(class_weights=list(self.class_weights.values()))
-        
-        # Create metrics
-        metrics = create_metrics()
-        
-        # Compile model
-        self.model.compile(
-            optimizer=tf.keras.optimizers.Adam(learning_rate=self.config['learning_rate']),
-            loss=loss_fn,
-            metrics=metrics
-        )
+        self.model = build_msafn_model()
         
         # Print model summary
         self.model.summary()
-        self.logger.info("Model built and compiled successfully")
         
-        # Log model architecture to file
-        with open(os.path.join(self.config['log_dir'], 'model_summary.txt'), 'w') as f:
-            self.model.summary(print_fn=lambda x: f.write(x + '\n'))
-    
-    def train_model(self):
-        """
-        Train the MSAFN model with standard approach
-        """
-        self.logger.info("Starting model training (Standard Approach)...")
-        
-        # Create callbacks
-        model_save_path = os.path.join(self.config['model_dir'], 'msafn_standard_best.h5')
-        tensorboard_dir = os.path.join(self.config['log_dir'], 'tensorboard_standard')
-        
-        callbacks = create_callbacks(
-            model_save_path=model_save_path,
-            log_dir=tensorboard_dir,
-            patience=self.config['patience']
-        )
-        
-        # Convert labels to categorical if needed
-        if len(np.unique(self.y_train)) > 2:
-            y_train_cat = tf.keras.utils.to_categorical(self.y_train)
-            y_val_cat = tf.keras.utils.to_categorical(self.y_val)
-        else:
-            y_train_cat = self.y_train
-            y_val_cat = self.y_val
-        
-        # Train the model
-        history = self.model.fit(
-            self.X_train, y_train_cat,
-            validation_data=(self.X_val, y_val_cat),
-            epochs=self.config['epochs'],
-            batch_size=self.config['batch_size'],
-            callbacks=callbacks,
-            verbose=1,
-            class_weight=self.class_weights
-        )
-        
-        self.logger.info("Training completed")
-        
-        # Plot training history
-        plot_training_history(history, self.config['plots_dir'])
-        
-        # Load best model
-        self.model = tf.keras.models.load_model(model_save_path, compile=False)
-        
-        # Recompile with metrics for evaluation
-        loss_fn = create_custom_loss(class_weights=list(self.class_weights.values()))
-        metrics = create_metrics()
+        # Compile model with advanced metrics
         self.model.compile(
-            optimizer=tf.keras.optimizers.Adam(learning_rate=self.config['learning_rate']),
-            loss=loss_fn,
-            metrics=metrics
+            optimizer=tf.keras.optimizers.Adam(learning_rate=Config.LEARNING_RATE),
+            loss='categorical_crossentropy',
+            metrics=[
+                'accuracy',
+                tf.keras.metrics.Precision(name='precision'),
+                tf.keras.metrics.Recall(name='recall'),
+                tf.keras.metrics.F1Score(name='f1_score')
+            ]
         )
         
-        return history
+        return self.model
     
-    def evaluate_model(self):
-        """
-        Comprehensive model evaluation
-        """
-        self.logger.info("Starting model evaluation...")
+    def setup_callbacks(self):
+        """Setup training callbacks"""
+        callbacks = []
         
-        # Get class names
-        label_encoder = self.preprocessor.label_encoder
-        class_names = label_encoder.classes_
-        
-        # Evaluate model
-        results = evaluate_model(
-            model=self.model,
-            X_test=self.X_test,
-            y_test=self.y_test,
-            class_names=class_names,
-            save_dir=self.config['plots_dir']
+        # Early stopping
+        early_stopping = tf.keras.callbacks.EarlyStopping(
+            monitor='val_loss',
+            patience=Config.PATIENCE,
+            min_delta=Config.MIN_DELTA,
+            restore_best_weights=True,
+            verbose=1
         )
+        callbacks.append(early_stopping)
         
-        # Log results
-        self.logger.info("Evaluation Results:")
-        self.logger.info(f"Accuracy: {results['accuracy']:.4f}")
-        self.logger.info(f"AUC Score: {results['auc_score']:.4f}")
-        self.logger.info(f"Macro F1: {results['macro_f1']:.4f}")
-        self.logger.info(f"Weighted F1: {results['weighted_f1']:.4f}")
-        
-        # Save detailed results
-        summary = create_experiment_summary(
-            results=results,
-            config=self.config,
-            save_path=os.path.join(self.config['log_dir'], 'experiment_summary.json')
+        # Model checkpoint
+        model_checkpoint = tf.keras.callbacks.ModelCheckpoint(
+            filepath=os.path.join(Config.MODEL_SAVE_PATH, 'msafn_standard_best.keras'),
+            monitor='val_f1_score',
+            mode='max',
+            save_best_only=True,
+            verbose=1
         )
+        callbacks.append(model_checkpoint)
         
-        # Add to experiment tracker
-        self.experiment_tracker.add_experiment(
-            name='MSAFN_Standard',
-            results=results,
-            config=self.config
+        # Reduce learning rate on plateau
+        reduce_lr = tf.keras.callbacks.ReduceLROnPlateau(
+            monitor='val_loss',
+            factor=0.2,
+            patience=10,
+            min_lr=1e-7,
+            verbose=1
         )
+        callbacks.append(reduce_lr)
         
-        return results
+        # TensorBoard logging
+        log_dir = os.path.join(Config.LOGS_PATH, f"msafn_standard_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}")
+        tensorboard = tf.keras.callbacks.TensorBoard(
+            log_dir=log_dir,
+            histogram_freq=1,
+            write_graph=True,
+            write_images=True
+        )
+        callbacks.append(tensorboard)
+        
+        return callbacks
     
-    def visualize_attention(self):
-        """
-        Create attention visualizations
-        """
-        self.logger.info("Creating attention visualizations...")
+    def train_model(self, X_data, y_data):
+        """Train the model with standard approach"""
+        X_train, X_val, X_test = X_data
+        y_train, y_val, y_test = y_data
         
-        # Create comprehensive attention dashboard
-        self.attention_visualizer.create_attention_dashboard(
-            model=self.model,
-            X_test=self.X_test,
-            y_test=self.y_test
+        print("\\n" + "=" * 60)
+        print("STARTING STANDARD TRAINING")
+        print("=" * 60)
+        
+        # Setup callbacks
+        callbacks = self.setup_callbacks()
+        
+        # Train model
+        self.history = self.model.fit(
+            X_train, y_train,
+            batch_size=Config.BATCH_SIZE,
+            epochs=Config.EPOCHS,
+            validation_data=(X_val, y_val),
+            callbacks=callbacks,
+            verbose=1
         )
         
-        self.logger.info("Attention visualizations completed")
+        return self.history
     
-    def run_complete_experiment(self):
-        """
-        Run the complete MSAFN standard training experiment
-        """
-        start_time = datetime.now()
-        self.logger.info(f"Starting complete MSAFN Standard Training experiment at {start_time}")
+    def evaluate_model(self, X_test, y_test, y_test_original):
+        """Comprehensive model evaluation"""
+        print("\\n" + "=" * 60)
+        print("MODEL EVALUATION")
+        print("=" * 60)
         
+        # Predictions
+        y_pred_proba = self.model.predict(X_test)
+        y_pred = np.argmax(y_pred_proba, axis=1)
+        
+        # Evaluation metrics
+        test_loss, test_accuracy, test_precision, test_recall, test_f1 = self.model.evaluate(
+            X_test, y_test, verbose=0
+        )
+        
+        print(f"Test Loss: {test_loss:.4f}")
+        print(f"Test Accuracy: {test_accuracy:.4f}")
+        print(f"Test Precision: {test_precision:.4f}")
+        print(f"Test Recall: {test_recall:.4f}")
+        print(f"Test F1-Score: {test_f1:.4f}")
+        
+        # Classification report
+        report = self.evaluator.generate_classification_report(y_test_original, y_pred)
+        
+        # Confusion matrix
+        self.evaluator.plot_confusion_matrix(
+            y_test_original, y_pred,
+            save_path=os.path.join(Config.PLOTS_PATH, 'confusion_matrix_standard.png')
+        )
+        
+        # Training history
+        self.evaluator.plot_training_history(
+            self.history,
+            save_path=os.path.join(Config.PLOTS_PATH, 'training_history_standard.png')
+        )
+        
+        return {
+            'accuracy': test_accuracy,
+            'precision': test_precision,
+            'recall': test_recall,
+            'f1_score': test_f1,
+            'predictions': y_pred,
+            'probabilities': y_pred_proba
+        }
+    
+    def visualize_attention(self, X_sample, y_sample):
+        """Visualize attention weights"""
+        print("\\nGenerating Attention Visualizations...")
+        
+        # Initialize visualizer
+        visualizer = AttentionVisualizer(self.model, self.preprocessor.feature_names)
+        
+        # Plot attention heatmap
         try:
-            # Step 1: Load and preprocess data
-            self.load_and_preprocess_data()
+            behavioral_attention, fusion_attention = visualizer.extract_attention_weights(X_sample[:100])
             
-            # Step 2: Build model
-            self.build_model()
+            visualizer.plot_attention_heatmap(
+                fusion_attention,
+                save_path=os.path.join(Config.PLOTS_PATH, 'attention_heatmap_standard.png')
+            )
             
-            # Step 3: Train model
-            history = self.train_model()
+            visualizer.plot_feature_attention_distribution(
+                X_sample[:100], y_sample[:100],
+                save_path=os.path.join(Config.PLOTS_PATH, 'feature_attention_standard.png')
+            )
             
-            # Step 4: Evaluate model
-            results = self.evaluate_model()
-            
-            # Step 5: Visualize attention
-            self.visualize_attention()
-            
-            end_time = datetime.now()
-            duration = end_time - start_time
-            
-            self.logger.info(f"Experiment completed successfully in {duration}")
-            self.logger.info(f"Final Results Summary:")
-            self.logger.info(f"  - Accuracy: {results['accuracy']:.4f}")
-            self.logger.info(f"  - AUC Score: {results['auc_score']:.4f}")
-            self.logger.info(f"  - Macro F1: {results['macro_f1']:.4f}")
-            
-            return {
-                'model': self.model,
-                'history': history,
-                'results': results,
-                'duration': duration
-            }
+            visualizer.plot_stream_contributions(
+                X_sample[:50],
+                save_path=os.path.join(Config.PLOTS_PATH, 'stream_contributions_standard.png')
+            )
             
         except Exception as e:
-            self.logger.error(f"Experiment failed with error: {str(e)}")
-            raise
+            print(f"Warning: Could not generate attention visualizations: {e}")
+    
+    def save_model(self):
+        """Save the trained model"""
+        model_path = os.path.join(Config.MODEL_SAVE_PATH, 'msafn_standard_final.keras')
+        self.model.save(model_path)
+        print(f"\\nModel saved to: {model_path}")
+        
+        # Save model architecture as JSON
+        model_json = self.model.to_json()
+        with open(os.path.join(Config.MODEL_SAVE_PATH, 'msafn_standard_architecture.json'), 'w') as json_file:
+            json_file.write(model_json)
+        
+        return model_path
 
 def main():
-    """
-    Main function to run MSAFN standard training
-    """
-    # Set console encoding to UTF-8 for Windows
-    import sys
-    if sys.platform == "win32":
-        import codecs
-        sys.stdout = codecs.getwriter("utf-8")(sys.stdout.detach())
-        sys.stderr = codecs.getwriter("utf-8")(sys.stderr.detach())
+    """Main training pipeline"""
+    print("MSAFN Network Intrusion Detection - Standard Training")
+    print("=" * 60)
     
-    # Configuration
-    config = {
-        # Data configuration
-        'data_files': {
-            'infilteration': 'Thursday-WorkingHours-Afternoon-Infilteration.pcap_ISCX.csv',
-            'webattacks': 'Thursday-WorkingHours-Morning-WebAttacks.pcap_ISCX.csv'
-        },
-        
-        # Training configuration
-        'epochs': 100,
-        'batch_size': 256,
-        'learning_rate': 0.001,
-        'patience': 15,
-        
-        # Data split configuration
-        'test_size': 0.2,
-        'val_size': 0.1,
-        'random_state': 42,
-        
-        # Class imbalance handling
-        'handle_imbalance': True,
-        'imbalance_method': 'smote_tomek',
-        
-        # Directory configuration
-        'log_dir': 'logs/msafn_standard',
-        'model_dir': 'models/msafn_standard',
-        'plots_dir': 'plots/msafn_standard',
-        'experiment_dir': 'experiments'
-    }
+    # Initialize trainer
+    trainer = MSAFNTrainer()
     
-    # Create and run experiment
-    experiment = MSAFNStandardTraining(config)
-    results = experiment.run_complete_experiment()
-    
-    print("\\n" + "="*60)
-    print("MSAFN STANDARD TRAINING COMPLETED SUCCESSFULLY!")
-    print("="*60)
-    print(f"Final Accuracy: {results['results']['accuracy']:.4f}")
-    print(f"Final AUC Score: {results['results']['auc_score']:.4f}")
-    print(f"Final Macro F1: {results['results']['macro_f1']:.4f}")
-    print(f"Training Duration: {results['duration']}")
-    print("="*60)
+    try:
+        # Prepare data
+        X_data, y_data_cat, y_data_original = trainer.prepare_data()
+        X_train, X_val, X_test = X_data
+        
+        # Build model
+        model = trainer.build_model()
+        
+        # Train model
+        history = trainer.train_model(X_data, y_data_cat)
+        
+        # Evaluate model
+        results = trainer.evaluate_model(X_test, y_data_cat[2], y_data_original[2])
+        
+        # Visualize attention
+        trainer.visualize_attention(X_test, y_data_original[2])
+        
+        # Save model
+        model_path = trainer.save_model()
+        
+        print("\\n" + "=" * 60)
+        print("TRAINING COMPLETED SUCCESSFULLY!")
+        print("=" * 60)
+        print(f"Final Results:")
+        print(f"- Test Accuracy: {results['accuracy']:.4f}")
+        print(f"- Test F1-Score: {results['f1_score']:.4f}")
+        print(f"- Model saved to: {model_path}")
+        print("- Visualizations saved to plots/ directory")
+        
+    except Exception as e:
+        print(f"\\nError during training: {e}")
+        raise e
 
 if __name__ == "__main__":
-    # Set random seeds for reproducibility
-    np.random.seed(42)
-    tf.random.set_seed(42)
-    
-    # Run main function
     main()
