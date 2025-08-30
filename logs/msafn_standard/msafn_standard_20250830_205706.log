@@ -1,0 +1,7 @@
+2025-08-30 20:57:06,091 - msafn_standard - INFO - Logging initialized for experiment: msafn_standard
+2025-08-30 20:57:06,092 - msafn_standard - INFO - Log file: logs/msafn_standard/msafn_standard_20250830_205706.log
+2025-08-30 20:57:06,092 - msafn_standard - INFO - MSAFN Standard Training initialized
+2025-08-30 20:57:06,092 - msafn_standard - INFO - Configuration: {'data_files': {'infilteration': 'Thursday-WorkingHours-Afternoon-Infilteration.pcap_ISCX.csv', 'webattacks': 'Thursday-WorkingHours-Morning-WebAttacks.pcap_ISCX.csv'}, 'epochs': 100, 'batch_size': 256, 'learning_rate': 0.001, 'patience': 15, 'test_size': 0.2, 'val_size': 0.1, 'random_state': 42, 'handle_imbalance': True, 'imbalance_method': 'smote_tomek', 'log_dir': 'logs/msafn_standard', 'model_dir': 'models/msafn_standard', 'plots_dir': 'plots/msafn_standard', 'experiment_dir': 'experiments'}
+2025-08-30 20:57:06,093 - msafn_standard - INFO - Starting complete MSAFN Standard Training experiment at 2025-08-30 20:57:06.093956
+2025-08-30 20:57:06,093 - msafn_standard - INFO - Starting data loading and preprocessing...
+2025-08-30 20:57:06,094 - data_preprocessing - INFO - Loading data from 2 files
