@@ -15,14 +15,14 @@ class Config:
     NUM_CLASSES = 5  # BENIGN, Infiltration, Brute Force, SQL Injection, XSS
     
     # Training parameters
-    BATCH_SIZE = 64
-    EPOCHS = 100
+    BATCH_SIZE = 640  # Increased for better GPU utilization
+    EPOCHS = 10  # Reduced for testing
     LEARNING_RATE = 0.001
     VALIDATION_SPLIT = 0.2
     TEST_SPLIT = 0.2
     
     # Early stopping
-    PATIENCE = 15
+    PATIENCE = 3  # Reduced patience for faster testing
     MIN_DELTA = 0.001
     
     # Model architecture
@@ -32,9 +32,12 @@ class Config:
     ATTENTION_HEADS = 8
     DROPOUT_RATE = 0.3
     
+    # Data balancing
+    USE_GPU_BALANCING = True  # Use GPU-accelerated balancing instead of SMOTE
+    
     # Progressive training
-    NORMAL_EPOCHS = 30
-    PROGRESSIVE_EPOCHS = 50
+    NORMAL_EPOCHS = 5  # Reduced for testing
+    PROGRESSIVE_EPOCHS = 5  # Reduced for testing
     
     # Paths
     MODEL_SAVE_PATH = "models"

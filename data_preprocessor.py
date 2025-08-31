@@ -7,9 +7,6 @@ import numpy as np
 from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.model_selection import train_test_split
 from sklearn.utils import shuffle
-from imblearn.over_sampling import SMOTE
-from imblearn.under_sampling import TomekLinks
-from imblearn.pipeline import Pipeline as ImbPipeline
 import tensorflow as tf
 from config import Config
 
@@ -91,6 +88,89 @@ class DataPreprocessor:
             
         return np.array(sequences), np.array(labels)
     
+    def gpu_balance_data(self, X, y, max_samples_per_class=50000):
+        """GPU-accelerated data balancing with memory optimization"""
+        print("Applying GPU-accelerated data balancing...")
+        
+        # Convert to tensors for GPU operations
+        X_tensor = tf.constant(X, dtype=tf.float32)
+        y_tensor = tf.constant(y, dtype=tf.int32)
+        
+        # Get unique classes and their counts
+        unique_labels, _, counts = tf.unique_with_counts(y_tensor)
+        unique_labels_np = unique_labels.numpy()
+        counts_np = counts.numpy()
+        
+        print(f"Original class distribution: {dict(zip(unique_labels_np, counts_np))}")
+        
+        # Set target count (use min of max_count and max_samples_per_class)
+        max_count = tf.reduce_max(counts)
+        target_count = min(max_count.numpy(), max_samples_per_class)
+        
+        print(f"Target samples per class: {target_count}")
+        
+        # Balance each class to match the target count
+        balanced_X_list = []
+        balanced_y_list = []
+        
+        for i, label in enumerate(unique_labels_np):
+            # Get indices for this class
+            class_mask = tf.equal(y_tensor, label)
+            class_indices = tf.where(class_mask)[:, 0]
+            class_X = tf.gather(X_tensor, class_indices)
+            class_y = tf.gather(y_tensor, class_indices)
+            
+            current_count = counts_np[i]
+            
+            if current_count < target_count:
+                # Calculate how many samples we need to generate
+                samples_needed = target_count - current_count
+                
+                # Random oversampling with noise injection
+                indices_to_repeat = tf.random.uniform([samples_needed], 0, current_count, dtype=tf.int32)
+                repeated_X = tf.gather(class_X, indices_to_repeat)
+                repeated_y = tf.gather(class_y, indices_to_repeat)
+                
+                # Add small amount of Gaussian noise
+                noise = tf.random.normal(tf.shape(repeated_X), mean=0.0, stddev=0.005)
+                repeated_X = repeated_X + noise
+                
+                # Combine original and synthetic samples
+                combined_X = tf.concat([class_X, repeated_X], axis=0)
+                combined_y = tf.concat([class_y, repeated_y], axis=0)
+            elif current_count > target_count:
+                # Downsample if class is too large
+                indices_to_keep = tf.random.uniform([target_count], 0, current_count, dtype=tf.int32)
+                combined_X = tf.gather(class_X, indices_to_keep)
+                combined_y = tf.gather(class_y, indices_to_keep)
+            else:
+                combined_X = class_X
+                combined_y = class_y
+            
+            balanced_X_list.append(combined_X)
+            balanced_y_list.append(combined_y)
+        
+        # Concatenate all balanced classes
+        balanced_X = tf.concat(balanced_X_list, axis=0)
+        balanced_y = tf.concat(balanced_y_list, axis=0)
+        
+        # Shuffle the balanced dataset
+        indices = tf.range(tf.shape(balanced_X)[0])
+        shuffled_indices = tf.random.shuffle(indices)
+        balanced_X = tf.gather(balanced_X, shuffled_indices)
+        balanced_y = tf.gather(balanced_y, shuffled_indices)
+        
+        # Convert back to numpy
+        balanced_X_np = balanced_X.numpy()
+        balanced_y_np = balanced_y.numpy()
+        
+        # Print final distribution
+        unique_final, counts_final = np.unique(balanced_y_np, return_counts=True)
+        print(f"Balanced class distribution: {dict(zip(unique_final, counts_final))}")
+        print(f"After balancing - X shape: {balanced_X_np.shape}")
+        
+        return balanced_X_np, balanced_y_np
+    
     def prepare_data(self, apply_balancing=True):
         """Complete data preparation pipeline"""
         # Load and clean data
@@ -105,16 +185,7 @@ class DataPreprocessor:
         
         # Apply balancing if requested
         if apply_balancing:
-            print("Applying SMOTE + Tomek Links balancing...")
-            smote_tomek = ImbPipeline([
-                ('smote', SMOTE(random_state=42, k_neighbors=3)),
-                ('tomek', TomekLinks())
-            ])
-            X_scaled, y_encoded = smote_tomek.fit_resample(X_scaled, y_encoded)
-            
-            print(f"After balancing - X shape: {X_scaled.shape}")
-            unique, counts = np.unique(y_encoded, return_counts=True)
-            print(f"Label distribution after balancing: {dict(zip(unique, counts))}")
+            X_scaled, y_encoded = self.gpu_balance_data(X_scaled, y_encoded)
         
         return X_scaled, y_encoded
     

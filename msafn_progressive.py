@@ -13,6 +13,21 @@ from sklearn.utils import shuffle
 import os
 import datetime
 
+# GPU optimization settings
+gpus = tf.config.experimental.list_physical_devices('GPU')
+if gpus:
+    try:
+        # Enable memory growth to avoid allocating all GPU memory at once
+        for gpu in gpus:
+            tf.config.experimental.set_memory_growth(gpu, True)
+        
+        print(f"GPU acceleration enabled. Found {len(gpus)} GPU(s)")
+        print("Memory growth enabled for efficient GPU utilization")
+    except RuntimeError as e:
+        print(f"GPU setup error: {e}")
+else:
+    print("No GPUs found, using CPU")
+
 # Import custom modules
 from config import Config
 from data_preprocessor import DataPreprocessor
@@ -73,6 +88,23 @@ class MSAFNProgressiveTrainer:
             'test_final': (X_test_final, y_test_final)
         }
     
+    def create_optimized_dataset(self, X, y, batch_size, shuffle=True):
+        """Create optimized tf.data.Dataset for better GPU utilization"""
+        # Create dataset
+        dataset = tf.data.Dataset.from_tensor_slices((X, y))
+        
+        if shuffle:
+            # Shuffle with a large buffer for good randomization
+            dataset = dataset.shuffle(buffer_size=10000)
+        
+        # Batch the data
+        dataset = dataset.batch(batch_size)
+        
+        # Prefetch for performance
+        dataset = dataset.prefetch(tf.data.AUTOTUNE)
+        
+        return dataset
+    
     def build_model(self):
         """Build and compile the MSAFN model for progressive training"""
         print("\\nBuilding MSAFN Model for Progressive Training...")
@@ -82,30 +114,33 @@ class MSAFNProgressiveTrainer:
         # Print model summary
         self.model.summary()
         
-        # Initial compilation for normal traffic (binary classification: normal vs anomaly)
+        # Initial compilation for categorical classification
         self.model.compile(
             optimizer=tf.keras.optimizers.Adam(learning_rate=Config.LEARNING_RATE),
-            loss='sparse_categorical_crossentropy',  # Will change to categorical later
+            loss='categorical_crossentropy',
             metrics=[
                 'accuracy',
                 tf.keras.metrics.Precision(name='precision'),
-                tf.keras.metrics.Recall(name='recall'),
-                tf.keras.metrics.F1Score(name='f1_score')
+                tf.keras.metrics.Recall(name='recall')
             ]
         )
         
         return self.model
     
     def setup_callbacks(self, phase="normal"):
-        """Setup training callbacks for different phases"""
+        """Setup training callbacks with best practices:
+        - EarlyStopping: Stops training when val_loss stops improving (patience varies by phase)
+        - ReduceLROnPlateau: Reduces learning rate when val_loss plateaus
+        - ModelCheckpoint: Saves best model based on val_accuracy
+        """
         callbacks = []
         
-        # Early stopping
-        patience = Config.PATIENCE if phase == "progressive" else Config.PATIENCE // 2
+        # Early stopping - improved configuration
+        patience = 10 if phase == "progressive" else 8  # Reduced patience for faster training
         early_stopping = tf.keras.callbacks.EarlyStopping(
             monitor='val_loss',
             patience=patience,
-            min_delta=Config.MIN_DELTA,
+            min_delta=0.001,
             restore_best_weights=True,
             verbose=1
         )
@@ -115,19 +150,19 @@ class MSAFNProgressiveTrainer:
         checkpoint_name = f'msafn_progressive_{phase}_best.keras'
         model_checkpoint = tf.keras.callbacks.ModelCheckpoint(
             filepath=os.path.join(Config.MODEL_SAVE_PATH, checkpoint_name),
-            monitor='val_f1_score',
+            monitor='val_accuracy',
             mode='max',
             save_best_only=True,
             verbose=1
         )
         callbacks.append(model_checkpoint)
         
-        # Reduce learning rate on plateau
+        # Reduce learning rate on plateau - improved configuration
         reduce_lr = tf.keras.callbacks.ReduceLROnPlateau(
             monitor='val_loss',
-            factor=0.5,
-            patience=5,
-            min_lr=1e-7,
+            factor=0.2,  # Reduce LR by 80%
+            patience=5,  # More responsive LR reduction
+            min_lr=0.001,  # Higher minimum LR
             verbose=1
         )
         callbacks.append(reduce_lr)
@@ -153,20 +188,33 @@ class MSAFNProgressiveTrainer:
         X_normal_train, y_normal_train = data_dict['normal_train']
         X_normal_val, y_normal_val = data_dict['normal_val']
         
-        # For normal-only training, we create a simple binary task
-        # All samples are labeled as 0 (normal)
-        y_normal_train_binary = np.zeros_like(y_normal_train)
-        y_normal_val_binary = np.zeros_like(y_normal_val)
+        # Convert to categorical for consistency with 5-class output
+        y_normal_train_cat = tf.keras.utils.to_categorical(y_normal_train, num_classes=Config.NUM_CLASSES)
+        y_normal_val_cat = tf.keras.utils.to_categorical(y_normal_val, num_classes=Config.NUM_CLASSES)
+        
+        # Recompile model for categorical crossentropy
+        self.model.compile(
+            optimizer=tf.keras.optimizers.Adam(learning_rate=Config.LEARNING_RATE),
+            loss='categorical_crossentropy',
+            metrics=[
+                'accuracy',
+                tf.keras.metrics.Precision(name='precision'),
+                tf.keras.metrics.Recall(name='recall')
+            ]
+        )
+        
+        # Create optimized datasets
+        train_dataset = self.create_optimized_dataset(X_normal_train, y_normal_train_cat, Config.BATCH_SIZE, shuffle=True)
+        val_dataset = self.create_optimized_dataset(X_normal_val, y_normal_val_cat, Config.BATCH_SIZE, shuffle=False)
         
         # Setup callbacks
         callbacks = self.setup_callbacks(phase="normal")
         
-        # Train on normal data
+        # Train on normal data with optimized datasets
         self.history_normal = self.model.fit(
-            X_normal_train, y_normal_train_binary,
-            batch_size=Config.BATCH_SIZE,
+            train_dataset,
             epochs=Config.NORMAL_EPOCHS,
-            validation_data=(X_normal_val, y_normal_val_binary),
+            validation_data=val_dataset,
             callbacks=callbacks,
             verbose=1
         )
@@ -207,8 +255,7 @@ class MSAFNProgressiveTrainer:
             metrics=[
                 'accuracy',
                 tf.keras.metrics.Precision(name='precision'),
-                tf.keras.metrics.Recall(name='recall'),
-                tf.keras.metrics.F1Score(name='f1_score')
+                tf.keras.metrics.Recall(name='recall')
             ]
         )
         
@@ -235,12 +282,14 @@ class MSAFNProgressiveTrainer:
             # Convert to categorical
             y_progressive_cat = tf.keras.utils.to_categorical(y_progressive, num_classes=Config.NUM_CLASSES)
             
+            # Create optimized dataset for sub-phase
+            progressive_dataset = self.create_optimized_dataset(X_progressive, y_progressive_cat, Config.BATCH_SIZE, shuffle=True)
+            
             # Train for fewer epochs in each sub-phase
             epochs_subphase = Config.PROGRESSIVE_EPOCHS // len(attack_ratios)
             
             history_subphase = self.model.fit(
-                X_progressive, y_progressive_cat,
-                batch_size=Config.BATCH_SIZE,
+                progressive_dataset,
                 epochs=epochs_subphase,
                 validation_data=(X_combined_val, y_combined_val_cat),
                 verbose=1
@@ -250,11 +299,14 @@ class MSAFNProgressiveTrainer:
         print("\\n--- Final Progressive Training Phase ---")
         callbacks = self.setup_callbacks(phase="progressive")
         
+        # Create optimized dataset for final phase
+        final_train_dataset = self.create_optimized_dataset(X_combined_train, y_combined_train_cat, Config.BATCH_SIZE, shuffle=True)
+        final_val_dataset = self.create_optimized_dataset(X_combined_val, y_combined_val_cat, Config.BATCH_SIZE, shuffle=False)
+        
         self.history_progressive = self.model.fit(
-            X_combined_train, y_combined_train_cat,
-            batch_size=Config.BATCH_SIZE,
+            final_train_dataset,
             epochs=Config.PROGRESSIVE_EPOCHS,
-            validation_data=(X_combined_val, y_combined_val_cat),
+            validation_data=final_val_dataset,
             callbacks=callbacks,
             verbose=1
         )
@@ -278,9 +330,13 @@ class MSAFNProgressiveTrainer:
         y_pred = np.argmax(y_pred_proba, axis=1)
         
         # Evaluation metrics
-        test_loss, test_accuracy, test_precision, test_recall, test_f1 = self.model.evaluate(
+        test_loss, test_accuracy, test_precision, test_recall = self.model.evaluate(
             X_test, y_test_cat, verbose=0
         )
+        
+        # Calculate F1 score manually using sklearn
+        from sklearn.metrics import f1_score
+        test_f1 = f1_score(y_test, y_pred, average='macro')
         
         print(f"Test Loss: {test_loss:.4f}")
         print(f"Test Accuracy: {test_accuracy:.4f}")

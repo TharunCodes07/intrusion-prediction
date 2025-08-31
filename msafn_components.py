@@ -42,7 +42,7 @@ class MultiHeadAttention(layers.Layer):
         
         # Scaled dot-product attention
         matmul_qk = tf.matmul(q, k, transpose_b=True)
-        dk = tf.cast(tf.shape(k)[-1], tf.float32)
+        dk = tf.cast(tf.shape(k)[-1], matmul_qk.dtype)  # Use same dtype as matmul_qk
         scaled_attention_logits = matmul_qk / tf.math.sqrt(dk)
         
         attention_weights = tf.nn.softmax(scaled_attention_logits, axis=-1)
@@ -53,6 +53,14 @@ class MultiHeadAttention(layers.Layer):
         
         output = self.dense(concat_attention)
         return output, attention_weights
+    
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            "num_heads": self.num_heads,
+            "d_model": self.d_model,
+        })
+        return config
 
 class TemporalStream(layers.Layer):
     """Temporal stream using CNN + BiLSTM"""
@@ -87,6 +95,13 @@ class TemporalStream(layers.Layer):
         x = self.dropout2(x, training=training)
         
         return x
+    
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            "units": self.units,
+        })
+        return config
 
 class StatisticalStream(layers.Layer):
     """Statistical stream using Dense layers with Batch Normalization"""
@@ -117,9 +132,16 @@ class StatisticalStream(layers.Layer):
         
         # Expand dims to match temporal stream output
         x = tf.expand_dims(x, axis=1)
-        x = tf.tile(x, [1, Config.SEQUENCE_LENGTH // 2, 1])
+        x = tf.tile(x, [1, Config.SEQUENCE_LENGTH // 2, 1])  # Use same as temporal after pooling
         
         return x
+    
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            "units": self.units,
+        })
+        return config
 
 class BehavioralStream(layers.Layer):
     """Behavioral stream using GRU with self-attention"""
@@ -143,7 +165,7 @@ class BehavioralStream(layers.Layer):
         
         # Create sequences for GRU
         x = tf.expand_dims(x, axis=1)
-        x = tf.tile(x, [1, Config.SEQUENCE_LENGTH, 1])
+        x = tf.tile(x, [1, Config.SEQUENCE_LENGTH // 2, 1])  # Match temporal stream after pooling
         
         # GRU processing
         x = self.gru(x)
@@ -153,6 +175,13 @@ class BehavioralStream(layers.Layer):
         x = self.dropout(attention_output, training=training)
         
         return x, attention_weights
+    
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            "units": self.units,
+        })
+        return config
 
 class AttentionFusion(layers.Layer):
     """Multi-head attention fusion layer"""
@@ -165,6 +194,9 @@ class AttentionFusion(layers.Layer):
         self.norm1 = layers.LayerNormalization(epsilon=1e-6)
         self.norm2 = layers.LayerNormalization(epsilon=1e-6)
         
+        # Add the projection layer to __init__ instead of creating it in call()
+        self.projection = layers.Dense(d_model)
+        
         self.ffn = tf.keras.Sequential([
             layers.Dense(d_model * 2, activation='relu'),
             layers.Dropout(Config.DROPOUT_RATE),
@@ -175,8 +207,8 @@ class AttentionFusion(layers.Layer):
         # Concatenate all streams
         fused_input = tf.concat(inputs, axis=-1)
         
-        # Project to common dimension
-        fused_input = layers.Dense(self.d_model)(fused_input)
+        # Project to common dimension using the pre-created layer
+        fused_input = self.projection(fused_input)
         
         # Multi-head attention
         attn_output, attention_weights = self.multi_head_attention(fused_input)
@@ -187,6 +219,14 @@ class AttentionFusion(layers.Layer):
         out2 = self.norm2(out1 + ffn_output)
         
         return out2, attention_weights
+    
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            "d_model": self.d_model,
+            "num_heads": self.num_heads,
+        })
+        return config
 
 def build_msafn_model(input_shape=(Config.FEATURE_DIM,), num_classes=Config.NUM_CLASSES):
     """Build the complete MSAFN model"""

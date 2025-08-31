@@ -11,6 +11,21 @@ from sklearn.metrics import classification_report, confusion_matrix
 import os
 import datetime
 
+# GPU optimization settings
+gpus = tf.config.experimental.list_physical_devices('GPU')
+if gpus:
+    try:
+        # Enable memory growth to avoid allocating all GPU memory at once
+        for gpu in gpus:
+            tf.config.experimental.set_memory_growth(gpu, True)
+        
+        print(f"GPU acceleration enabled. Found {len(gpus)} GPU(s)")
+        print("Memory growth enabled for efficient GPU utilization")
+    except RuntimeError as e:
+        print(f"GPU setup error: {e}")
+else:
+    print("No GPUs found, using CPU")
+
 # Import custom modules
 from config import Config
 from data_preprocessor import DataPreprocessor
@@ -65,22 +80,25 @@ class MSAFNTrainer:
             metrics=[
                 'accuracy',
                 tf.keras.metrics.Precision(name='precision'),
-                tf.keras.metrics.Recall(name='recall'),
-                tf.keras.metrics.F1Score(name='f1_score')
+                tf.keras.metrics.Recall(name='recall')
             ]
         )
         
         return self.model
     
     def setup_callbacks(self):
-        """Setup training callbacks"""
+        """Setup training callbacks with best practices:
+        - EarlyStopping: Stops training when val_loss stops improving
+        - ReduceLROnPlateau: Reduces learning rate when val_loss plateaus
+        - ModelCheckpoint: Saves best model based on val_accuracy
+        """
         callbacks = []
         
-        # Early stopping
+        # Early stopping - improved configuration
         early_stopping = tf.keras.callbacks.EarlyStopping(
             monitor='val_loss',
-            patience=Config.PATIENCE,
-            min_delta=Config.MIN_DELTA,
+            patience=10,  # Reduced patience for faster stopping
+            min_delta=0.001,
             restore_best_weights=True,
             verbose=1
         )
@@ -89,19 +107,19 @@ class MSAFNTrainer:
         # Model checkpoint
         model_checkpoint = tf.keras.callbacks.ModelCheckpoint(
             filepath=os.path.join(Config.MODEL_SAVE_PATH, 'msafn_standard_best.keras'),
-            monitor='val_f1_score',
+            monitor='val_accuracy',
             mode='max',
             save_best_only=True,
             verbose=1
         )
         callbacks.append(model_checkpoint)
         
-        # Reduce learning rate on plateau
+        # Reduce learning rate on plateau - improved configuration
         reduce_lr = tf.keras.callbacks.ReduceLROnPlateau(
             monitor='val_loss',
-            factor=0.2,
-            patience=10,
-            min_lr=1e-7,
+            factor=0.2,  # Reduce LR by 80%
+            patience=5,  # Reduce patience for more responsive LR reduction
+            min_lr=0.001,  # Higher minimum LR
             verbose=1
         )
         callbacks.append(reduce_lr)
@@ -118,6 +136,23 @@ class MSAFNTrainer:
         
         return callbacks
     
+    def create_optimized_dataset(self, X, y, batch_size, shuffle=True):
+        """Create optimized tf.data.Dataset for better GPU utilization"""
+        # Create dataset
+        dataset = tf.data.Dataset.from_tensor_slices((X, y))
+        
+        if shuffle:
+            # Shuffle with a large buffer for good randomization
+            dataset = dataset.shuffle(buffer_size=10000)
+        
+        # Batch the data
+        dataset = dataset.batch(batch_size)
+        
+        # Prefetch for performance
+        dataset = dataset.prefetch(tf.data.AUTOTUNE)
+        
+        return dataset
+    
     def train_model(self, X_data, y_data):
         """Train the model with standard approach"""
         X_train, X_val, X_test = X_data
@@ -127,15 +162,18 @@ class MSAFNTrainer:
         print("STARTING STANDARD TRAINING")
         print("=" * 60)
         
+        # Create optimized datasets
+        train_dataset = self.create_optimized_dataset(X_train, y_train, Config.BATCH_SIZE, shuffle=True)
+        val_dataset = self.create_optimized_dataset(X_val, y_val, Config.BATCH_SIZE, shuffle=False)
+        
         # Setup callbacks
         callbacks = self.setup_callbacks()
         
-        # Train model
+        # Train model with optimized datasets
         self.history = self.model.fit(
-            X_train, y_train,
-            batch_size=Config.BATCH_SIZE,
+            train_dataset,
             epochs=Config.EPOCHS,
-            validation_data=(X_val, y_val),
+            validation_data=val_dataset,
             callbacks=callbacks,
             verbose=1
         )
